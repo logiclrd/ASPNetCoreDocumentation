@@ -138,10 +138,6 @@ await System.Text.JsonSerializer.SerializeAsync(httpContext.Response.Body, recor
 
 (This code would be placed within the `ExecuteResultAsync` method of an `IActionResult` implementation or the `InvokeAsync` method of a middleware class.)
 
-> **Note**: As of writing (October 2022), ASP.NET Core does not leverage System.Text.Json's ability to serialize `IAsyncEnumerable` sources directly. It always buffers the entirety of the `IAsyncEnumerable` before sending the response.
-> 
-> If you want the enumeration of the sequence to be done asynchronously as well, you will need to write a loop to do this explicitly within your controller or middleware.
-
 ## Buffering
 
 There are some caveats and gaps with the above implementations surrounding buffering.
