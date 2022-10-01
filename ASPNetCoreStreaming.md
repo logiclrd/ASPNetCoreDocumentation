@@ -36,6 +36,8 @@ In this case, you will need to explicitly implement the enumeration yourself. If
 
 Typical controller implementations separate handling the request from delivering the result to the client. To support situations where the implementation needs tighter coupling to the process of writing results to the client, ASP.NET Core provides the type `IActionResult`, which allows you to defer actually producing the result from the controller. At a point in time after your controller's route method has returned, ASP.NET Core will call into the `ExecuteAsync` method of the class implementing the interface when results actually need to be sent to the client, giving over full control over how the data is sent.
 
+This example shows how this might be done with the Newtonsoft.Json serializer.
+
 ```
 public class AsyncEnumerableActionResult<T> : IActionResult
 {
