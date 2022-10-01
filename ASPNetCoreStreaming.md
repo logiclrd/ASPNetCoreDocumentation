@@ -12,29 +12,65 @@ The sample code presented in this article assumes that you are using Dependency 
 
 It is also assumed that types will typically be exposed by means of interfaces. This is a common practice that enables "mock" objects to be injected into instances to allow automated testing, which can greatly improve code quality. You may adapt the examples here to your project's conventions as needed.
 
-## Controllers
+## Structured Data with System.Text.Json
 
-If you need to stream data from an endpoint in an ASP.NET Core MVC Controller, there is a particular pattern that allows you to avoid buffering.
+If you need to stream a series of objects to be serialized, the ASP.NET Core infrastructure handles the details of this for you. You can return an `IEnumerable` or `IAsyncEnumerable` from a controller and it will stream data from it automatically until the data runs out or the client disconnects.
 
-With a typical ASP.NET Core Controller endpoint, you simply return a model object of the type you want to be returned. When returning an indeterminate number of records that are all of the same type, it is tempting to use `IEnumerable<T>` or `IAsyncEnumerable<T>` to produce an enumeration of items to be serialized to the client. However, ASP.NET Core will try to read this enumeration through to its end before it starts writing anything to the client. If there is no end, then it will eventually run out of buffer space and fail:
+There may be circumstances in which you want to control the enumeration process more finely, such as linking certain operations in an `IAsyncEnumerable` to other `CancellationToken`s, such as to enforce timeouts. In this case, you can return an `IAsyncEnumerable` implementation that yields the desired sequence. It is important to include the ASP.NET Core stack's `RequestAborted` cancellation token in your operations, so that if the client disconnects mid-way, this translates to an immediate cancellation of the underlying operation. If you need to provide your own reasons for cancellation in addition, such as timeouts, you can use the method `CancellationTokenSource.CreateLinkedTokenSource` to derive a token that will signal cancellation as soon as any of the linked tokens does so.
+
+## Structured Data with Alternative Serializers
+
+If your web project is not using System.Text.Json to serialize data, then `IAsyncEnumerable` may not be fully supported. For serializers with no async serialization support, ASP.NET Core will attempt to automatically buffer the entire enumeration before sending it to the serializer as a conventional collection. This approach can work when the length of the enumeration is fixed and relatively small, but the following circumstances are not compatible with this workaround:
+
+* You are delivering a very large amount of data.
+* You are delivering data on-demand, and it is important that elements be sent as soon as they are available.
+* Your enumeration does not have an end of its own, and continues as long as the client accepts data.
+
+In these cases, if you return an `IAsyncEnumerable` from your controller (including one implemented implicitly within a controller method using `yield return`), your service will attempt to buffer all of the data, and will encounter an error such as:
 
 > System.InvalidOperationException: 'AsyncEnumerableReader' reached the configured maximum size of the buffer when enumerating a value of type 'TestController+<Get>d__4'. This limit is in place to prevent infinite streams of 'IAsyncEnumerable<>' from continuing indefinitely. If this is not a programming mistake, consider ways to reduce the collection size, or consider manually converting 'TestController+<Get>d__4' into a list rather than increasing the limit.
 
-The solution to this is to serialize the items to the HTTP request body stream yourself. To support this, ASP.NET Core provides the type `IActionResult`, which allows you to defer actually producing the result from the controller. At a point in time after your controller's route method has returned, ASP.NET Core will call into the `ExecuteAsync` method of the class implementing the interface when results actually need to be sent to the client, giving over full control over how the data is sent.
+In this case, you will need to explicitly implement the enumeration yourself. If you are using a serializer that does not have async serialization support, then any object being sent will need to be fully serialized before it can be sent to the client. However, by taking charge of the JSON array structure, you can turn each element into an independent object for serialization. The enumeration as a whole does not need to be serialized before data can be sent.
+	
+### Controllers
+
+Typical controller implementations separate handling the request from delivering the result to the client. To support situations where the implementation needs tighter coupling to the process of writing results to the client, ASP.NET Core provides the type `IActionResult`, which allows you to defer actually producing the result from the controller. At a point in time after your controller's route method has returned, ASP.NET Core will call into the `ExecuteAsync` method of the class implementing the interface when results actually need to be sent to the client, giving over full control over how the data is sent.
+  
+The `HttpResponse` type has an extension method `WriteAsJsonAsync` that will use whichever JSON serializer your project has registered. 
 
 ```
-public class MyActionResult : IActionResult
+public class AsyncEnumerableActionResult<T> : IActionResult
 {
-  IDataSource _dataSource;
+  IAsyncEnumerable<T> _dataSource;
   
-  public MyActionResult(IDataSource dataSource)
+  public MyActionResult(IAsyncEnumerable<T> dataSource)
   {
     _dataSource = dataSource;
   }
   
+  static readonly byte[] JSONArrayStart = new byte[] { (byte)'[' };
+  static readonly byte[] JSONArraySeparator = new byte[] { (byte)',' };
+  static readonly byte[] JSONArrayEnd = new byte[] { (byte)']' };
+
   public async Task ExecuteResultAsync(ActionContext context)
   {
-    await _dataSource.WriteToStreamAsync(context.HttpContext.Response.Body);
+    await context.HttpContext.Response.Write(JSONArrayStart, context.HttpContext.RequestAborted);
+
+    bool isFirstItem = true;
+  
+    await foreach (T item in _dataSource.WithCancellation(context.HttpContext.RequestAborted))
+    {
+      if (!isFirstItem)
+        await context.HttpContext.Response.Write(JSONArraySeparator, context.HttpContext.RequestAborted);
+  
+      var itemJson = JsonConvert.SerializeObject(item);
+  
+      await context.HttpContext.Response.WriteAsync(itemJson, context.HttpContext.RequestAborted);
+  
+      isFirstItem = false;
+    }
+  
+    await context.HttpContext.Response.Write(JSONArrayEnd, context.HttpContext.RequestAborted);
   }
 }
 
@@ -50,7 +86,7 @@ public class MyController
   [HttpGet]
   public IActionResult GetData()
   {
-    return new MyActionResult(_dataSourceFactory.GetDataSource());
+    return new AsyncEnumerableActionResult(_dataSourceFactory.GetDataSource());
   }
 }
 ```
@@ -84,24 +120,40 @@ public class MyMiddleware
       return InvokeAsyncImplementation(context);
   }
   
+  static readonly byte[] JSONArrayStart = new byte[] { (byte)'[' };
+  static readonly byte[] JSONArraySeparator = new byte[] { (byte)',' };
+  static readonly byte[] JSONArrayEnd = new byte[] { (byte)']' };
+
   async Task InvokeAsyncImplementation(HttpContext context)
   {
-    await _dataSource.WriteToStreamAsync(context.Response.Body);
+    await context.HttpContext.Response.Write(JSONArrayStart, context.HttpContext.RequestAborted);
+
+    bool isFirstItem = true;
+  
+    await foreach (T item in _dataSource.WithCancellation(context.HttpContext.RequestAborted))
+    {
+      if (!isFirstItem)
+        await context.HttpContext.Response.Write(JSONArraySeparator, context.HttpContext.RequestAborted);
+  
+      var itemJson = JsonConvert.SerializeObject(item);
+  
+      await context.HttpContext.Response.WriteAsync(itemJson, context.HttpContext.RequestAborted);
+  
+      isFirstItem = false;
+    }
+  
+    await context.HttpContext.Response.Write(JSONArrayEnd, context.HttpContext.RequestAborted);
   }
 }
 ```
 
 ## Raw Data
 
-The preceding examples have used an abstract `IDataSource` object as the source of data to be written to the request body stream. In most applications, the exact data type will be known and will be the same for all requests. One common form of data is a raw byte stream, for instance from the output of a video codec or the creation of a file archive (provided that the format supports being written from start to finish without seeking).
+Sometimes the data returned by a service is not a structured object that be returned e.g. as JSON, but a raw byte stream. For instance, this may be from the output of a video codec or the creation of a file archive (provided that the format supports being written from start to finish without seeking).
 
 When writing raw data to the underlying stream, it will be necessary for this data to be provided in chunks that can be sent to the client in a loop. For instance, if the source of the data is another `Stream` object from which the data to be sent to the client is read, the loop might look like this:
 
-> WARNING: Incomplete code example. Do not use as-is.
-
 ```
-// This code example is incomplete. Please read to the end of the article for a complete discussion.
-
 HttpContext httpContext = ...;
 Stream sourceStream = ...;
 
@@ -109,85 +161,51 @@ byte[] buffer = new byte[8192];
 
 while (true)
 {
-  int numBytesRead = await sourceStream.ReadAsync(buffer, 0, buffer.Length);
+  int numBytesRead = await sourceStream.ReadAsync(buffer, 0, buffer.Length, httpContext.RequestAborted);
   
   if (numBytesRead <= 0)
     break;
     
-  await httpContext.Body.WriteAsync(buffer, 0, numBytesRead);
+  await httpContext.Body.WriteAsync(buffer, 0, numBytesRead, httpContext.RequestAborted);
 }
-```
-
-(This code would be placed within the `ExecuteResultAsync` method of an `IActionResult` implementation or the `InvokeAsync` method of a middleware class.)
-
-## Structured Data
-
-If the data you are returning is a series of objects produced by an `IEnumerable<T>` or `IAsyncEnumerable<T>`, then you can pass this enumerable object directly to the serializer. The serializer will automatically emit the enumerable as an array, and it will serialize each item as it is read without buffering. If the enumeration blocks while obtaining data for further records, then the stream of data to the client will simply pause until it is available. The serializer will write the end of the array only when the enumeration indicates there are no further records. If your enumeration never terminates, then the serializer will continue to write data to the client indefinitely.
-
-> WARNING: Incomplete code example. Do not use as-is.
-
-```
-// This code example is incomplete. Please read to the end of the article for a complete discussion.
-
-HttpContext httpContext = ...;
-
-IEnumerable<Record> recordsToSend = ...;
-
-await System.Text.JsonSerializer.SerializeAsync(httpContext.Response.Body, recordsToSend);
 ```
 
 (This code would be placed within the `ExecuteResultAsync` method of an `IActionResult` implementation or the `InvokeAsync` method of a middleware class.)
 
 ## Buffering
 
-There are some caveats and gaps with the above implementations surrounding buffering.
+Generally speaking, buffering greatly improves the performance of services performing I/O. ASP.NET Core will automatically perform buffering in most situations. This may affect the ability of your service to deliver data in real time.
 
-### HTTP Response Stream
+The underlying HTTP response stream is buffered by the server hosting your ASP.NET Core web application. This means that data sent to the client will not actually be delivered until it has reached a critical threshold in size. If you are sending small objects that need to arrive in a timely manner, such as a stream of indeterminate length of notification packets, this buffering can introduce delays into the delivery of the messages.
 
-First and foremost, the underlying HTTP response stream is buffered by the server hosting your ASP.NET Core web application. This means that data sent to the client will not actually be delivered until it has reached a critical threshold in size. If you are sending small objects that need to arrive in a timely manner, such as a stream of indeterminate length of notification packets, this buffering can introduce delays into the delivery of the messages.
+If you supply an `IAsyncEnumerable` to the ASP.NET Core web stack, it will disable this buffering, and elements of the enumeration are delivered to the client as soon as they become available. If your source of items is a synchronous `IEnumerable`, then a considerable amount of data may be buffered before anything is sent to the client.
 
-If your data needs to be delivered in a timely manner, such that records produced up to now need to be delivered now and not wait for further data to be produced, then you will need to explicitly flush the response stream after you have queued up the data you need sent. This is easy to do with a single call:
-
-> WARNING: Incomplete code example. Do not use as-is.
+If your data needs to be delivered in a timely manner, such that records produced up to now need to be delivered now and not wait for further data to be produced, then consider using an `IAsyncEnumerable` to yield the items. If you must use an `IEnumerable`, then you will need to explicitly flush the response stream after each item. This will require you to take charge of the JSON array structure. This example shows how you might do this within an `IActionResult` implementation:
 
 ```
-// This code example is incomplete. Please read to the end of the article for a complete discussion.
-await httpContext.Body.FlushAsync();
-```
+  static readonly byte[] JSONArrayStart = new byte[] { (byte)'[' };
+  static readonly byte[] JSONArraySeparator = new byte[] { (byte)',' };
+  static readonly byte[] JSONArrayEnd = new byte[] { (byte)']' };
 
-### JSON Serializer
-
-If you are using a JSON serializer to deliver structured data from an `IEnumerable<T>`, be aware also that the System.Text.Json serializer itself performs buffering of its output before delivering it to the underlying stream. This greatly improves performance. If your endpoint is producing and returning records as quickly as it can, then this buffering is a good thing and will ensure that the data is transferred to the client as efficiently as possible. However, if your data source includes blocking operations that wait for state to change, and you need the objects returned to be delivered to the client as soon as they are available, System.Text.Json's buffering will prevent this.
-
-One way around this is to take charge of the JSON array structure, and invoke the JSON serializer separately for each item:
-
-> WARNING: Incomplete code example. Do not use as-is.
-
-```
-// This code example is incomplete. Please read to the end of the article for a complete discussion.
-
-static readonly byte[] JSONArrayStart = new byte[] { (byte)'[' };
-static readonly byte[] JSONArraySeparator = new byte[] { (byte)',' };
-static readonly byte[] JSONArrayEnd = new byte[] { (byte)']' };
-
-public void StreamEnumerable(Stream stream, IEnumerable<T> dataSource)
-{
-  await stream.WriteAsync(JSONArrayStart);
-
-  bool first = true;
-
-  foreach (var item in dataSource)
+  public async Task ExecuteResultAsync(ActionContext context)
   {
-    if (first)
-      first = false;
-    else
-      await stream.WriteAsync(JSONArraySeparator);
-					
-    await JsonSerializer.SerializeAsync(stream, item, serializerOptions);
-  }
+    await context.HttpContext.Response.Write(JSONArrayStart, context.HttpContext.RequestAborted);
 
-  await stream.WriteAsync(JSONArrayEnd);
-}
+    bool isFirstItem = true;
+  
+    await foreach (T item in _dataSource.WithCancellation(context.HttpContext.RequestAborted))
+    {
+      if (!isFirstItem)
+        await context.HttpContext.Response.Write(JSONArraySeparator, context.HttpContext.RequestAborted);
+  
+      await context.HttpContext.Response.WriteAsync(item, context.HttpContext.RequestAborted);
+      await context.HttpContext.Response.Body.FlushAsync();
+  
+      isFirstItem = false;
+    }
+  
+    await context.HttpContext.Response.Write(JSONArrayEnd, context.HttpContext.RequestAborted);
+  }
 ```
 
 ## Aborted Requests
@@ -244,9 +262,13 @@ public async Task StreamAsyncEnumerableWithTimeout(Stream stream, IAsyncEnumerab
 	
 It is important to ensure, as shown, that the `CancellationTokenSource` is `Dispose`d (such as with a `using` block), otherwise your service will leak resources.
 
-## Complete Example
+## Complete Examples
 
-The following example, written both as a controller using `IActionResult` and as middleware, takes song lyrics and repeats them indefinitely until the caller disconnects.
+The following examples, written both as a controller using `IActionResult` and as middleware, take song lyrics and repeat them indefinitely until the caller disconnects.
+  
+The `iAsyncEnumerable` example assumes that System.Text.Json is being used for JSON serialization and shows the simple path that leverages functionality built into ASP.NET Core.
+  
+The `IEnumerable` example assumes that Newtonsoft.Json is being used for JSON serialization and shows how the JSON array can be serialized in real time, as items arrive, without needing the entire enumeration to be read before the response can be started.
 
 ### Source Code
 
@@ -254,7 +276,35 @@ A solution containing all of the examples presented here is available in the fol
 
 https://github.com/logiclrd/ASPNetCoreStreamingExample
 
-### Controller Example
+### `IAsyncEnumerable` with System.Text.Json
+
+```
+  public interface ILyricsSource
+  {
+    IAsyncEnumerable<string> GetSongLyricsAsync(CancellationToken token);
+  }
+
+  [Route("/v1")]
+  public class SongLyricsController : Controller
+  {
+    ILyricsSource _lyricsSource;
+
+    public SongLyricsController(ILyricsSource lyricsSource)
+    {
+      _lyricsSource = lyricsSource;
+    }
+
+    [HttpGet("sing")]
+    public IActionResult PerformSong()
+    {
+      return _lyricsSource.GetSongLyricsAsync(HttpContext.RequestAborted);
+    }
+  }
+```
+
+### `IEnumerable` with Newtonsoft.Json
+
+#### Controller Example
 
 ```
   public interface ILyricsSource
@@ -313,7 +363,7 @@ https://github.com/logiclrd/ASPNetCoreStreamingExample
   }
 ```
 
-### Middleware Example
+#### Middleware Example
 
 ```
   public interface ILyricsSource
