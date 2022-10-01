@@ -138,9 +138,9 @@ await System.Text.JsonSerializer.SerializeAsync(httpContext.Response.Body, recor
 
 (This code would be placed within the `ExecuteResultAsync` method of an `IActionResult` implementation or the `InvokeAsync` method of a middleware class.)
 
-> **Note**: As of writing (May 2020), System.Text.Json does not support serializing from `IAsyncEnumerable<T>` sequences. Only `IEnumerable<T>` can be used. This does not mean that your sequence will have to run to completion synchronously before data is sent, only that each separate item's retrieval from the enumerator will be synchronous.
->
-> There is an outstanding issue for adding support for `IAsyncEnumerable<T>` to `System.Text.Json`.
+> **Note**: As of writing (October 2022), ASP.NET Core does not leverage System.Text.Json's ability to serialize `IAsyncEnumerable` sources directly. It always buffers the entirety of the `IAsyncEnumerable` before sending the response.
+> 
+> If you want the enumeration of the sequence to be done asynchronously as well, you will need to write a loop to do this explicitly within your controller or middleware.
 
 ## Buffering
 
@@ -211,6 +211,42 @@ In order to account for this, ASP.NET Core code that is streaming responses to c
 * All calls to send data to the response's body stream should be made using `Async` methods, and should supply `HttpContext.RequestAborted` as `CancellationToken`.
 
 The natural assumption that the body stream will detect that it can no longer deliver data to the client and raise an exception is incorrect.
+	
+### Timeouts and Other Sources of Cancellation
+	
+Asynchronous calls cannot be given multiple `CancellationToken`s simultaneously. As such, you cannot provide your own `CancellationToken` at the same time as `HttpContext.RequestAborted`. There is a simple solution to this problem, though: The `CancellationTokenSource.CreateLinkedTokenSource` method, which has several overloads, allows you to derive a single `CancellationToken` that will signal cancellation as soon as any of the supplied `CancellationToken`s enters the cancelled state.
+	
+Example:
+
+```
+public async Task StreamAsyncEnumerableWithTimeout(Stream stream, IAsyncEnumerable<T> dataSource, TimeSpan timeout, CancellationToken externalCancellationToken)
+{
+  using (var cancellationTokenSource = CancellationTokenSource.CreateLinkedTokenSource(HttpContext.RequestAborted, externalCancellationToken))
+  {
+    cancellationTokenSource.CancelAfter(timeout);
+  
+    var linkedToken = cancellationTokenSource.Token;
+
+    await stream.WriteAsync(JSONArrayStart, linkedToken);
+
+    bool first = true;
+
+    foreach (var item in dataSource)
+    {
+      if (first)
+        first = false;
+      else
+        await stream.WriteAsync(JSONArraySeparator, linkedToken);
+					
+      await JsonSerializer.SerializeAsync(stream, item, serializerOptions, linkedToken);
+    }
+
+    await stream.WriteAsync(JSONArrayEnd);
+  }
+}
+```
+	
+It is important to ensure, as shown, that the `CancellationTokenSource` is `Dispose`d (such as with a `using` block), otherwise your service will leak resources.
 
 ## Complete Example
 
